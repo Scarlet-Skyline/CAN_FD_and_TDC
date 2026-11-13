@@ -12,7 +12,7 @@ def main():
         commands.add_parser(command)
     send = commands.add_parser("can-send")
     send.add_argument("id", help="11-bit hex ID, without 0x")
-    send.add_argument("data", help="0–8 bytes in hex, or '-' for no data")
+    send.add_argument("data", help="0-8 bytes in hex, or '-' for no data")
     args = parser.parse_args()
 
     try:

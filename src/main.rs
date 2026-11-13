@@ -9,9 +9,16 @@ mod wiring;
 
 use board::Usb;
 use embassy_executor::Spawner;
-use embassy_futures::{join::join4, select::select};
-use embassy_stm32::can::Can;
-use embassy_stm32::usart::BufferedUart;
+use embassy_futures::{
+    join::{join, join4},
+    select::{Either, select},
+};
+//use embassy_stm32::usart::BufferedUart;
+use embassy_stm32::{
+    can::{CanRx, CanTx, Frame},
+    usart::BufferedUart,
+};
+//use embassy_time::{Duration, Ticker};
 use embassy_usb::{
     Builder,
     class::cdc_acm::{CdcAcmClass, State},
@@ -21,9 +28,19 @@ use panic_halt as _;
 use static_cell::StaticCell;
 use swd::Swd;
 
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 const PACKET: usize = 64;
 // Track linker-script changes so Cargo relinks the firmware.
 const _: &[u8] = include_bytes!("../memory.x");
+// use embassy_sync::{
+//     blocking_mutex::raw::CriticalSectionRawMutex,
+//     channel::Channel,
+// };
+/// CAN 接收 → 主机发送：容量 8 帧，满时丢弃最旧帧
+static CAN_RX_CHANNEL: Channel<CriticalSectionRawMutex, Frame, 8> = Channel::new();
+
+/// 主机请求 → CAN 发送：容量 4 帧，满时回 ERR BUSY
+static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, Frame, 4> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -52,37 +69,119 @@ async fn main(_spawner: Spawner) {
     let control = CdcAcmClass::new(&mut builder, CTL_STATE.init(State::new()), PACKET as u16);
     let serial = CdcAcmClass::new(&mut builder, UART_STATE.init(State::new()), PACKET as u16);
     let mut device = builder.build();
-    join4(
-        device.run(),
-        control_port(control, ports.can, swd),
-        uart_port(serial, ports.uart),
-        dap.run(),
+    let (can_tx, can_rx, _props) = ports.can.split();
+    // spawner.spawn(can_rx_task(can_rx)).unwrap();
+    // spawner.spawn(can_tx_task(can_tx)).unwrap();
+    // join4(
+    // device.run(),
+    // can_rx_task(can_rx),
+    // can_tx_task(can_tx),
+    // control_port(control, swd),
+    // // 如果要保留 UART 透传，可以用 join5，把 uart_port 也放进来
+    // );
+    join(
+        join4(
+            device.run(),
+            control_port(control, swd),
+            uart_port(serial, ports.uart),
+            dap.run(),
+        ),
+        join(can_rx_task(can_rx), can_tx_task(can_tx)),
     )
     .await;
 }
 
 async fn control_port(
     mut usb: CdcAcmClass<'static, Usb>,
-    mut can: Can<'static>,
+    //mut can: Can<'static>,
     mut swd: Option<Swd>,
 ) {
     let mut packet = [0; PACKET];
+    //let mut ticker = Ticker::every(Duration::from_millis(500)); // 每 500ms 触发一次
     loop {
         usb.wait_connection().await;
         let mut line = protocol::Line::new();
-        'connection: while let Ok(n) = usb.read_packet(&mut packet).await {
-            for &byte in &packet[..n] {
-                if let Some(command) = line.push(byte) {
-                    let reply = protocol::execute(command, &mut can, &mut swd).await;
-                    // Responses are bounded below 64 B, so USB needs no extra ZLP.
-                    if usb.write_packet(reply.as_bytes()).await.is_err() {
-                        break 'connection;
+
+        loop {
+            let read_usb = async { usb.read_packet(&mut packet).await.ok() };
+            let read_can = async { CAN_RX_CHANNEL.receive().await };
+
+            match select(read_usb, read_can).await {
+                // 1. 收到来自主机的 USB 数据
+                Either::First(Some(n)) => {
+                    for &byte in &packet[..n] {
+                        if let Some(command) = line.push(byte) {
+                            match protocol::execute(command, &mut swd).await {
+                                protocol::Action::Reply(reply) => {
+                                    if usb.write_packet(reply.as_bytes()).await.is_err() {
+                                        break; // USB断连
+                                    }
+                                }
+                                protocol::Action::SendCan(frame) => {
+                                    match CAN_TX_CHANNEL.try_send(frame) {
+                                        Ok(()) => {
+                                            let _ = usb.write_packet(b"OK QUEUED\n").await;
+                                        }
+                                        Err(_) => {
+                                            let _ = usb.write_packet(b"ERR BUSY\n").await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 2. USB 读取错误或断开
+                Either::First(None) => break,
+                // 3. 收到来自 CAN 的帧，主动推送给主机
+                Either::Second(frame) => {
+                    let text = protocol::format_rx(&frame);
+                    if usb.write_packet(text.as_bytes()).await.is_err() {
+                        break;
                     }
                 }
             }
         }
     }
 }
+
+//#[embassy_executor::task]
+async fn can_rx_task(mut rx: CanRx<'static>) {
+    loop {
+        let envelope = match rx.read().await {
+            Ok(e) => e,
+            Err(_) => continue, // 总线错误，继续接收
+        };
+        let frame = envelope.frame;
+
+        // 有界缓冲：满时丢弃最旧帧，保证 CAN 接收不被阻塞
+        let _ = CAN_RX_CHANNEL.try_send(frame);
+    }
+}
+
+//#[embassy_executor::task]
+async fn can_tx_task(mut tx: CanTx<'static>) {
+    loop {
+        let frame = CAN_TX_CHANNEL.receive().await;
+        // 用 try_write 非阻塞发送；队列满时短暂等待后重试
+        let _ = tx.write(&frame).await;
+        //embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
+        // match CAN_TX_CHANNEL.try_send(frame) {
+        //     Ok(_) => break,
+        //     Err(_) => {
+        //         embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
+        //     }
+        // }
+    }
+}
+
+// async fn usb_tx_task(mut usb_tx: <Usb as ...>::EndpointIn) {
+//     loop {
+//         let frame = CAN_RX_CHANNEL.receive().await;
+//         let text = protocol::format_rx(&frame); // "RX <ID> <DATA>\n"
+//         let _ = usb_tx.write_packet(text.as_bytes()).await;
+//     }
+// }
 
 async fn uart_port(usb: CdcAcmClass<'static, Usb>, uart: Option<BufferedUart<'static>>) {
     let Some(uart) = uart else {

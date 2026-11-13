@@ -12,9 +12,11 @@ use embassy_stm32::{
         mux::{Fdcansel, Usbsel},
     },
     time::Hertz,
+    usart,
     usb::{self, Driver},
 };
 use static_cell::StaticCell;
+//use static_cell::StaticCell;
 
 pub type Usb = Driver<'static, peripherals::USB_OTG_HS>;
 
@@ -25,6 +27,11 @@ bind_interrupts!(struct UsbIrqs {
 bind_interrupts!(struct CanIrqs {
     FDCAN1_IT0 => IT0InterruptHandler<peripherals::FDCAN1>;
     FDCAN1_IT1 => IT1InterruptHandler<peripherals::FDCAN1>;
+});
+
+// <--- 新增：UART8 的中断绑定，注意这里加了 pub --->
+bind_interrupts!(pub struct UartIrqs {
+    USART1 => usart::BufferedInterruptHandler<peripherals::USART1>;
 });
 
 /// The clock tree is provided. Keep SYSCLK at its default HSI setting.
