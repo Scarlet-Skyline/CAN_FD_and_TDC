@@ -1,78 +1,97 @@
-# HerKules L4 作业 · DM-MC02 USB 调试器
+拓展任务二：5 Mbit/s CAN FD 与 TDC 实现说明
 
-## MCU 是什么，程序怎么装进去
+在要求高速传输数据的情况下，classical CAN 难以处理，换用 FD CAN 总线处理。启用BRS（Bit Rate Switch, 位速率切换）来调传输速度，TDC（Transmitter Delay Compensation，发送器延迟补偿）来负责在高速数据段（5 Mbit/s）中，保证发送节点能正确“监听到”自己发出的数据，防止误报错并导致总线崩溃。
 
-**MCU（Microcontroller Unit，微控制器）**把 CPU、程序存储器 Flash、运行时内存 SRAM 和 GPIO、UART、USB 等外设集成在一颗芯片里。**STM32** 是 STMicroelectronics 的微控制器系列，**STM32H723VG** 是 DM-MC02 板上使用的具体芯片。烧录是把编译后的固件写入 Flash。板子正常复位后，MCU 从 Flash 启动并运行这份固件。
+#具体原理：CAN 协议要求发送节点必须一边发数据，一边通过收发器（TX 到 RX 引脚）回读总线上的电平，确认自己发出去的位没有被别人篡改。但在 5 Mbit/s 的高速下，位时间极短（200ns），而信号穿过收发器芯片是有物理延迟的（可能高达 100ns）。如果发送节点还在原来的时间点去采样，读到的可能还是上一个位的电平，就会误以为发生了“位错误（Bit Error）”。
+TDC 的作用就是计算出这个物理延迟，并在数据段重新定义一个二次采样点（SSP）。发送节点不按原计划时间采样了，而是往后推迟一点，等信号从收发器绕一圈回来了，再在 SSP 点去采样，这样就绝不会读错了。
 
-USB-C 提供连接，板子当前运行的程序决定电脑能通过 USB 做什么。本作业固件正常启动时，USB 提供调试探针和串口功能。要通过 USB 给这颗 STM32 本身烧录，可以先让它启动 ST 预装在系统存储器里的 **Bootloader（引导程序）**。进入 **USB DFU（Device Firmware Upgrade）** 模式后，电脑可以用支持 DFU 的工具将固件写入 Flash。STM32H723 支持这条路径，前提是板子接出了对应的 USB 信号并进入系统引导模式。[ST AN2606，STM32H72xxx/73xxx](https://www.st.com/resource/en/application_note/an2606-stm32-microcontroller-system-memory-boot-mode-stmicroelectronics.pdf)
 
-本作业首次烧录使用**外置调试探针**。电脑上的 `probe-rs` 通过外置探针和板上的 SWD 口写入 DM-MC02 的 Flash。烧好以后，DM-MC02 就能通过自己的 GPIO 和 SWD 读取目标芯片的调试端口 ID。
+一、 总体说明（入口与数据路径）
+代码入口：程序入口位于 src/main.rs 的 main 函数。该函数初始化了时钟、外设，并启动了多个并发的异步任务。
 
-## 我们要做什么
+数据路径：
 
-假设 STM32 程序运行到一半，某个变量突然变成了 0。你可以用电脑上的**调试软件**在那行代码设断点，让目标芯片执行到那里时暂停，再检查变量、寄存器或内存。probe-rs 和 OpenOCD 都可以通过调试探针访问目标芯片。
+接收（CAN → 主机）：can_rx_task 通过中断读取 FDCAN1 的 FD 帧，放入容量为 8 的 CAN_RX_CHANNEL 队列。control_port 任务从队列取出数据，通过 protocol.rs 格式化为十六进制字符串，经 USB CDC 发送给主机。
 
-完整的 **USB 调试探针**位于电脑和目标芯片之间。电脑把调试命令通过 USB 发给探针。探针用两个 GPIO 产生 SWD 信号，把请求送到目标芯片，再把结果传回电脑。
+发送（主机 → CAN）：主机通过 USB 发送文本指令，control_port 解析后放入容量为 4 的 CAN_TX_CHANNEL 队列。can_tx_task 取出 FD 帧并调用 FDCAN 驱动发送到总线上。
 
-```text
-电脑（probe-rs / OpenOCD）
-        ↕ USB 上的 CMSIS-DAP v2
-USB 调试探针
-        ↕ 两根 SWD 信号线
-目标 STM32（芯片内置的调试端口）
-```
+并发与缓冲：基于 Embassy 异步框架。使用 Channel 实现任务间通信。当 CAN_RX_CHANNEL 满时，丢弃最新帧以保证接收任务不阻塞；当 CAN_TX_CHANNEL 满时，向主机返回 ERR BUSY。protocol.rs 中的解析缓冲区已扩大至 256 字节，足以容纳 64 字节（128 hex 字符）载荷转换后的长字符串。
 
-| 名称 | 在这条路径中的作用 |
-| --- | --- |
-| **CMSIS-DAP v2** | 电脑和探针之间的 USB 命令格式，例如请求探针读取一个调试寄存器。 |
-| **SWD（Serial Wire Debug）** | 探针和目标芯片之间的通信接口。探针用 `SWCLK` 提供时钟，双方轮流驱动 `SWDIO` 来发送数据。 |
-| **DAP（Debug Access Port）** | 目标芯片内置的调试硬件。它接收 SWD 请求，并提供访问芯片调试功能的入口。 |
+关键配置：board.rs 中配置了 FDCAN1 的仲裁段和数据段时序，启用了 BRS 和 TDC，并设置为 AllowFdCanAndBRS （比如classical CAN用 classicalOnly即可） 模式。
 
-作业用 **DM-MC02 演示这条路径的两个部分**。先用 `probe-rs list` 找到 CMSIS-DAP v2 演示接口。这个接口只提供设备发现所需的信息。再通过控制串口发 `SWD ID`，让 DM-MC02 实际产生 SWD 信号并读取目标的 **DPIDR**（Debug Port Identification Register，调试端口识别寄存器）。可把两个 GPIO 回接到同一块板的 SWD 口完成这项测试，CPU 会继续运行 USB 固件。
+二、位时序/采样点计算，TDC配置，FD帧处理和协议格式
 
-同一根 USB-C 数据线也提供两个串口。UART 串口转发原始字节，CAN/控制串口接收 `PING`、`SWD ID` 和 CAN 收发命令。
+1. 位时序参数计算
 
-## 完成两项配置
+FDCAN 内核时钟（fdcansel 选择 PLL2_Q）为 80 MHz。
+时间量子 Tq=1/80 MHz = 12.5ns 
 
-在 `src/wiring.rs` 补全两个 TODO。
+仲裁段（1 Mbit/s）：
 
-1. **SWD GPIO**。从板卡上选两个可接线的 3.3 V GPIO。SWCLK 用初始电平为低的 `Output`，SWDIO 用可切换方向的 `Flex`。记录 MCU 引脚和接插件脚号。可以从外露的 PWM 信号脚里选。
-2. **UART**。配置 TX、RX、中断和静态收发缓冲区，使用 115200 baud、8N1。有 P16 转接板可用 UART8。也可选板上独立的 UART7 接口，按原理图确认信号脚和方向。检查所选引脚与 SWD 是否冲突。
+目标位时间 = 1/1 Mbit/s = 1000ns = 80Tq
 
-[作业参考](references/README.md)提供达妙原理图和使用说明书的原件链接，以及 GPIO 和 Buffered UART 示例。
+参数：prescaler = 1，TSEG1 (seg1) = 59，TSEG2 (seg2) = 20，SJW = 20。
 
-## 已提供的内容
+##
+位时序（Bit Timing）定义了CAN总线上一个位（Bit）的时间长度是如何划分的，它决定了通信的波特率和采样点位置。一个位时间被划分为多个时间量子（Tq），通常包含以下几个段：
 
-- `src/board.rs` 提供 RCC、USB 和 CAN1 的配置。Classical CAN 使用 80 MHz 内核时钟、1 Mbit/s 和 75% 采样点。Prescaler 为 1，TSEG1 为 59 tq，TSEG2 与 SJW 均为 20 tq。
-- `src/dap_usb.rs` 提供 CMSIS-DAP v2 的 USB 枚举和少量 `DAP_Info` 应答。完成 GPIO 配置前，就可以检查 USB 是否列出两个串口和演示探针。[Arm DAP_Info 文档](https://arm-software.github.io/CMSIS-DAP/latest/group__DAP__Info.html)
-- `src/swd.rs` 提供读取 DPIDR 所需的 GPIO 时序。补全 SWD GPIO 后，用控制串口的 `SWD ID` 测试。GPIO 尚未配置时，命令回复 `ERR SWD_NOT_CONFIGURED`。
+同步段（Sync_Seg）：用于同步总线上的各个节点，固定为1个Tq。
 
-## 编译、烧录和验收
+传播段（Prop_Seg）：用于补偿信号在总线上的物理传播延迟。
 
-需要 Rust 工具链、probe-rs 和一根 USB 数据线。用外置探针烧录 DM-MC02。烧录前先断开 SWD 回接跳线。
+相位缓冲段1（Phase_Seg1） 和 相位缓冲段2（Phase_Seg2）：用于补偿节点间的时钟误差。
 
-```sh
-cargo build --locked
-cargo run --locked
-```
+采样点（Sample Point）：位于Phase_Seg1结束处，是节点读取总线电平的时刻。
 
-烧录结束后断电并拔掉外置探针。将选定的 SWCLK 和 SWDIO 接到目标板对应信号。可以用同一块 DM-MC02 的 P1 做自测。P1.3 是 SWCLK，P1.4 是 SWDIO。同板只接两根信号线。两板测试则接 SWCLK、SWDIO 和 GND，两板分别供电。按实物核对接插件方向，信号线接信号脚。
+同步跳转宽度（SJW）：定义了在一次同步中，位时间可以被延长或缩短的最大Tq数。
 
-通过 USB-C 重新连接电脑。运行主机测试脚本前，安装 Python 3 和 `pyserial`，并确认运行 `host.py` 的同一个 Python 环境能导入 `serial`。用 `python3 -m serial.tools.list_ports` 查看串口，用 `PING` 确认控制口。将下面的 `CONTROL_PORT` 和 `UART_PORT` 换成实际串口名。
+在配置寄存器时，Prop_Seg和Phase_Seg1通常被合并称为TSEG1，Phase_Seg2被称为TSEG2。采样点位置的计算公式为：
 
-```sh
-probe-rs list
-python3 host.py CONTROL_PORT ping
-python3 host.py CONTROL_PORT swd
-python3 host.py CONTROL_PORT swd
-python3 host.py CONTROL_PORT ping
-python3 host.py UART_PORT uart-loopback
-```
+Sample Point (%) = (Sync_Seg + TSEG1) / (Sync_Seg + TSEG1 + TSEG2) × 100%。
+##
 
-检查 `probe-rs list` 是否列出 `DM-MC02 CMSIS-DAP Demo`，两次 DPIDR 是否一致，以及最后一次 `PING` 是否正常。作业的标准探针接口只验收发现，实际 SWD 读取用 `SWD ID`。UART 测试前用跳线短接所选 UART 的 TX 和 RX。脚本会逐字节核对回环数据。
+所以仲裁段采样点计算：
+(1+59)/80=75%
 
-## 提交
 
-交 `src/wiring.rs`、引脚表和实测记录。引脚表写清 SWCLK、SWDIO、UART TX 和 RX 的 MCU 引脚与接插件脚号。记录测试命令、结果和未测项目，并说明一项你用实测确认的配置。
+数据段（5 Mbit/s）：
 
-选做可用现成的 Classical CAN 与第二个节点交换帧，或继续尝试 CAN FD 和 Linux SocketCAN。
+目标位时间 = 1/5 Mbit/s = 200 ns =16Tq
+
+
+参数：prescaler = 1，TSEG1 (seg1) = 12，TSEG2 (seg2) = 3，SJW = 3。
+
+采样点计算：
+(1+12)/16=81.25%
+
+
+2. TDC（发送延迟补偿）配置
+
+单位与设置：在代码中，通过设置 transceiver_delay_compensation: true 启用了 TDC。
+
+！！！关于 TDCO/TDCF 的说明：由于当前工程依赖的 embassy-stm32 = 0.6.0 版本 API 限制，DataBitTiming 结构体中未暴露 tdc_offset (TDCO，TDC偏移量，可用于配置SSP最终位置) 和 tdc_filter_window_length (TDCF，可以设定SSP最小位置，避免过早采样采到噪声) 字段。在当前配置下，硬件将使用默认参数或自动测量环路延迟来计算 SSP 位置。（board.rs中把这两行注释掉了，不然编译过不了）
+
+注意：跑起来应该没问题，但是如果发现高速数据段通信不稳定，可能需要升级库版本以手动微调 TDCO/TDCF。
+
+3. FD 帧处理与协议格式
+帧格式：使用 FdFrame 类型替代原经典 CAN 的 Frame。通过 FrameTransmissionConfig::AllowFdCanAndBRS 允许发送 FD 帧并开启 BRS（位速率切换）。（board.rs中启用的）
+
+主机协议边界：采用文本协议，以换行符 \n 作为帧边界。
+
+发送示例：CAN TX 123 112233445566778899AABBCC（ID: 0x123，载荷为 12 字节）。
+
+接收示例：RX 123 112233445566778899AABBCC。
+
+在所使用的DMTool的上位机软件中，分别选择串口/CAN窗口可进行发送。仲裁段/数据段的波特率配置也可以在“设备配置中进行配置”。
+
+长载荷处理：DLC（数据长度码）由硬件根据写入的字节数自动推断。protocol.rs 中的 Line 解析器将缓冲区增大到 256 字节，并将允许的十六进制字符长度上限从 16 提升至 128，确保 64 字节（128个 hex 字符）的载荷能够被完整解析并送入 FdFrame。
+
+三、 上板验证预期
+当前硬件行为均为预期设计，尚未上板验证。 编译成功证明代码具备生成固件的能力。后续上板时，需要保证DMTool满足以下条件：
+
+匹配 1 Mbit/s 仲裁段和 5 Mbit/s 数据段的位时序。
+
+开启 CAN FD 和 BRS 支持。
+
+保证物理总线（CAN_H/CAN_L）终端电阻匹配，且收发器支持 5 Mbps 速率。
+

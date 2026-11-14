@@ -4,7 +4,7 @@ use embassy_stm32::{
     Config, Peri, Peripherals, bind_interrupts,
     can::{
         Can, CanConfigurator, IT0InterruptHandler, IT1InterruptHandler,
-        config::{FrameTransmissionConfig, NominalBitTiming},
+        config::{DataBitTiming, FrameTransmissionConfig, NominalBitTiming},
     },
     peripherals,
     rcc::{
@@ -82,10 +82,25 @@ pub fn can1(
         seg2: NonZeroU8::new(20).unwrap(),
         sync_jump_width: NonZeroU8::new(20).unwrap(),
     };
+
+    // 2. 数据段 (Data Phase)：5 Mbit/s, 采样点 ~81.25%
+    // 时钟 80MHz，prescaler=1，Tq=12.5ns。5Mbps = 200ns = 16 Tq。
+    // 采样点 (1 + 12) / 16 = 81.25%
+    let data_timing = DataBitTiming {
+        prescaler: NonZeroU16::new(1).unwrap(),
+        seg1: NonZeroU8::new(12).unwrap(),
+        seg2: NonZeroU8::new(3).unwrap(),
+        sync_jump_width: NonZeroU8::new(3).unwrap(),
+        transceiver_delay_compensation: true, // 启用 TDC
+                                              //tdc_offset: 12,                       // TDCO = 数据段 seg1
+                                              //tdc_filter_window_length: 0,          // TDCF
+    };
+
     let config = can
         .config()
         .set_nominal_bit_timing(timing)
-        .set_frame_transmit(FrameTransmissionConfig::ClassicCanOnly);
+        .set_frame_transmit(FrameTransmissionConfig::AllowFdCanAndBRS);
+
     can.set_config(config);
     can.into_normal_mode()
 }

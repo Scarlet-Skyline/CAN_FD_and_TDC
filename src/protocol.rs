@@ -1,25 +1,25 @@
 use core::fmt::Write;
-use embassy_stm32::can::Frame;
+use embassy_stm32::can::frame::FdFrame;
 use heapless::String;
 
 use crate::swd::Swd;
 
-type Reply = String<63>;
+type Reply = String<256>;
 
 pub struct Line {
-    bytes: [u8; 96],
+    bytes: [u8; 256],
     len: usize,
 }
 
 pub enum Action {
     Reply(Reply),
-    SendCan(embassy_stm32::can::Frame),
+    SendCan(FdFrame),
 }
 
 impl Line {
     pub const fn new() -> Self {
         Self {
-            bytes: [0; 96],
+            bytes: [0; 256],
             len: 0,
         }
     }
@@ -103,21 +103,21 @@ pub async fn execute(command: &str, swd: &mut Option<Swd>) -> Action {
     }
 }
 
-fn parse_frame(id: &str, payload: &str) -> Option<Frame> {
+fn parse_frame(id: &str, payload: &str) -> Option<FdFrame> {
     let id = u16::from_str_radix(id, 16).ok()?;
-    let mut bytes = [0; 8];
+    let mut bytes = [0u8; 64];
     let payload = if payload == "-" { "" } else { payload };
     if !payload.is_ascii() || payload.len() > 128 || !payload.len().is_multiple_of(2) {
         return None;
     }
-    //let len = payload.len() / 2;
+    let len = payload.len() / 2;
     for (i, byte) in bytes[..payload.len() / 2].iter_mut().enumerate() {
         *byte = u8::from_str_radix(&payload[i * 2..i * 2 + 2], 16).ok()?;
     }
-    Frame::new_standard(id, &bytes[..payload.len()]).ok()
+    FdFrame::new_standard(id, &bytes[..len]).ok()
 }
 
-pub fn format_rx(frame: &embassy_stm32::can::Frame) -> Reply {
+pub fn format_rx(frame: &FdFrame) -> Reply {
     let mut out = Reply::new();
     let id = match frame.id() {
         embedded_can::Id::Standard(id) => id.as_raw(),

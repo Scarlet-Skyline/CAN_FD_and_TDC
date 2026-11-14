@@ -15,7 +15,7 @@ use embassy_futures::{
 };
 //use embassy_stm32::usart::BufferedUart;
 use embassy_stm32::{
-    can::{CanRx, CanTx, Frame},
+    can::{CanRx, CanTx, frame::FdFrame},
     usart::BufferedUart,
 };
 //use embassy_time::{Duration, Ticker};
@@ -37,10 +37,10 @@ const _: &[u8] = include_bytes!("../memory.x");
 //     channel::Channel,
 // };
 /// CAN 接收 → 主机发送：容量 8 帧，满时丢弃最旧帧
-static CAN_RX_CHANNEL: Channel<CriticalSectionRawMutex, Frame, 8> = Channel::new();
+static CAN_RX_CHANNEL: Channel<CriticalSectionRawMutex, FdFrame, 8> = Channel::new();
 
 /// 主机请求 → CAN 发送：容量 4 帧，满时回 ERR BUSY
-static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, Frame, 4> = Channel::new();
+static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, FdFrame, 4> = Channel::new();
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -148,7 +148,7 @@ async fn control_port(
 //#[embassy_executor::task]
 async fn can_rx_task(mut rx: CanRx<'static>) {
     loop {
-        let envelope = match rx.read().await {
+        let envelope = match rx.read_fd().await {
             Ok(e) => e,
             Err(_) => continue, // 总线错误，继续接收
         };
@@ -164,7 +164,7 @@ async fn can_tx_task(mut tx: CanTx<'static>) {
     loop {
         let frame = CAN_TX_CHANNEL.receive().await;
         // 用 try_write 非阻塞发送；队列满时短暂等待后重试
-        let _ = tx.write(&frame).await;
+        let _ = tx.write_fd(&frame).await;
         //embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
         // match CAN_TX_CHANNEL.try_send(frame) {
         //     Ok(_) => break,
